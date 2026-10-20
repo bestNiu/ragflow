@@ -51,6 +51,16 @@ services:
     environment:
       - KVROCKS_HOST=kvrocks
       - KVROCKS_PORT=6379
+      # Outbound egress (model gateways, public internet) must go through the
+      # HTTP proxy running on the Docker host: this network has no direct route
+      # to the internet. host.docker.internal is mapped to the host below.
+      # Internal services resolve into 172.16.0.0/12 and bypass the proxy.
+      - HTTP_PROXY=${RAGFLOW_HTTP_PROXY:-}
+      - HTTPS_PROXY=${RAGFLOW_HTTPS_PROXY:-}
+      - NO_PROXY=${RAGFLOW_NO_PROXY:-}
+      - http_proxy=${RAGFLOW_HTTP_PROXY:-}
+      - https_proxy=${RAGFLOW_HTTPS_PROXY:-}
+      - no_proxy=${RAGFLOW_NO_PROXY:-}
     networks:
       - ragflow
     restart: unless-stopped

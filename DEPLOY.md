@@ -308,6 +308,115 @@ docker exec -i ragflow-mysql-1 mysql -uroot -p"$MYSQL_PWD" \
 
 也可在前端管理端（<http://192.168.0.211:8088/admin> → 用户管理 → 修改密码）修改。
 
+### 6.3 模型接入（union AI gateway）
+
+本环境通过 `https://ai-gateway.union-laboratory.com`（OpenAI 兼容网关）提供模型能力，已为普通账号
+`chengs@unionclin.com` 的租户完成配置。
+
+#### 6.3.1 前置：容器必须能出网
+
+宿主与容器都**没有**公网直连路由，只有宿主上的 HTTP 代理 `127.0.0.1:7890` 可出网。RAGFlow 进程在容器内，
+必须显式注入代理，否则「添加模型 / 校验连接 / 拉取模型列表 / 实际推理」全部表现为超时或失败：
+
+```yaml
+# docker/docker-compose.yml → services.ragflow-cpu.environment
+- HTTP_PROXY=${RAGFLOW_HTTP_PROXY:-}
+- HTTPS_PROXY=${RAGFLOW_HTTPS_PROXY:-}
+- NO_PROXY=${RAGFLOW_NO_PROXY:-}
+- http_proxy=${RAGFLOW_HTTP_PROXY:-}
+- https_proxy=${RAGFLOW_HTTPS_PROXY:-}
+- no_proxy=${RAGFLOW_NO_PROXY:-}
+```
+
+```bash
+# docker/.env
+RAGFLOW_HTTP_PROXY=http://host.docker.internal:7890
+RAGFLOW_HTTPS_PROXY=http://host.docker.internal:7890
+RAGFLOW_NO_PROXY=localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,mysql,minio,es01,kvrocks,nats,clickhouse,tei
+```
+
+> `host.docker.internal` 由 compose 的 `extra_hosts: host.docker.internal:host-gateway` 映射到宿主。
+> `NO_PROXY` 里的私网段与服务名保证 MySQL / MinIO / ES / Kvrocks / NATS 等内部流量**不走**代理。
+
+自检：
+
+```bash
+docker exec ragflow-ragflow-cpu-1 sh -c \
+  'curl -s -o /dev/null -w "%{http_code}\n" https://ai-gateway.union-laboratory.com/v1/models \
+   -H "Authorization: Bearer $RAGFLOW_API_KEY"'
+# 期望 200；502/超时说明代理或 NO_PROXY 配错
+```
+
+#### 6.3.2 网关能力（已实测）
+
+| 能力 | 路径 | 说明 |
+|---|---|---|
+| 模型列表 | `GET /v1/models` | 71 个模型 |
+| 对话 | `POST /v1/chat/completions` | OpenAI 兼容 |
+| 向量 | `POST /v1/embeddings` | `text-embedding-v4`，默认 **1024 维**，**单请求最多 10 条** |
+| 重排 | `POST /v1/rerank` | Jina/Cohere 风格，`qwen3-rerank` |
+
+#### 6.3.3 已完成的配置
+
+| 项 | 值 |
+|---|---|
+| Provider | `OpenAI-API-Compatible` |
+| Instance | `union-gateway` |
+| Base URL | `https://ai-gateway.union-laboratory.com/v1`（**必须带 `/v1`**） |
+| API Key | 见 `tenant_model_instance.api_key`（部署时写入） |
+| 对话模型（默认） | `deepseek-v4.1-flash-1017`（另含 `qwen3.8-max`） |
+| 向量模型（默认） | `text-embedding-v4` |
+| 重排模型（默认） | `qwen3-rerank` |
+| 视觉模型 | `qwen3-vl-plus`（chat + vision） |
+
+向量模型的 `tenant_model.extra` 必须带维度/批大小元数据，否则调用报
+`input embedding max dimension is nil`：
+
+```json
+{"max_tokens": 8192, "max_dimension": 1024, "dimensions": [1024], "max_batch_size": 10}
+```
+
+同时 `docker/.env` 中 `EMBEDDING_BATCH_SIZE=10`（默认 16 会被网关以 400 拒绝）。
+
+#### 6.3.4 验证
+
+```bash
+BASE=http://127.0.0.1:8088
+B=$(printf '%s' '<普通用户密码>' | base64)
+TOK=$(curl -s -D - -o /dev/null -X POST $BASE/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d "{\"email\":\"chengs@unionclin.com\",\"password\":\"$B\"}" \
+  | grep -i '^authorization:' | sed 's/^[Aa]uthorization: //' | tr -d '\r')
+
+# 1) 租户默认模型
+curl -s -H "Authorization: $TOK" $BASE/api/v1/users/me/models
+
+# 2) 对话
+curl -s -X POST $BASE/api/v1/chat/to_model -H "Authorization: $TOK" \
+  -H 'Content-Type: application/json' \
+  -d '{"provider_name":"OpenAI-API-Compatible","instance_name":"union-gateway","model_name":"deepseek-v4.1-flash-1017","question":"你好"}'
+
+# 3) 向量（注意 dimension=1024）
+curl -s -X POST $BASE/api/v1/embeddings -H "Authorization: $TOK" \
+  -H 'Content-Type: application/json' \
+  -d '{"provider_name":"OpenAI-API-Compatible","instance_name":"union-gateway","model_name":"text-embedding-v4","texts":["hello"],"dimension":1024}'
+
+# 4) 重排
+curl -s -X POST $BASE/api/v1/rerank -H "Authorization: $TOK" \
+  -H 'Content-Type: application/json' \
+  -d '{"provider_name":"OpenAI-API-Compatible","instance_name":"union-gateway","model_name":"qwen3-rerank","query":"什么是RAG","documents":["RAG是检索增强生成","今天天气不错"]}'
+```
+
+#### 6.3.5 在界面上自行添加模型（新租户参考）
+
+1. 用**普通账号**登录 <http://192.168.0.211:8088>（超管会被 403 拦截，见 8 节）；
+2. 右上角头像 → **模型提供商** → 添加提供商 → 选择 `OpenAI-API-Compatible`；
+3. 实例名填 `union-gateway`，API Key 填网关 Key，Base URL 填 `https://ai-gateway.union-laboratory.com/v1`；
+4. 保存后点「校验连接」，在模型列表中勾选需要的模型（向量模型要填维度 1024）；
+5. 回到模型提供商首页，把默认对话/向量/重排模型切到刚添加的模型。
+
+> 说明：API Key 以明文保存在 `tenant_model_instance.api_key`（上游设计如此），数据库备份需按敏感数据管理。
+
 ---
 
 ## 7. 日常运维
@@ -416,6 +525,12 @@ docker image prune                 # 清理悬空镜像
 | nginx 返回 502 | api_server 尚在启动 | 等待 `/api/v1/system/healthz` 返回 200；`docker compose logs -f ragflow-cpu` |
 | 访问 8443 失败 | 镜像 nginx 不监听 443 | 预期行为；需要 TLS 请前置反代 |
 | `admin@ragflow.io` 登录失败 | 密码是 Go 启动时的硬编码默认值 | 按 6.2 重置密码；命令行验证时密码需 base64 |
+| 模型配置页 / 模型相关接口 403 | 用了超管账号（`is_superuser=1`）| 超管只能进 `/admin`；用普通账号登录主界面 |
+| 添加模型时连接超时 / 拉不到模型列表 | 容器没有出网代理 | 按 6.3.1 配 `RAGFLOW_HTTP_PROXY` + `NO_PROXY`，重建容器 |
+| 模型接口 404 | Base URL 少了 `/v1` | 填 `https://ai-gateway.union-laboratory.com/v1` |
+| `input embedding max dimension is nil` | `tenant_model.extra` 缺维度/批大小元数据 | 补 `max_dimension/dimensions/max_batch_size`（见 6.3.3） |
+| embeddings 返回 400 `InternalError.Algo` | `text-embedding-v4` 单批最多 10 条 | `.env` 设 `EMBEDDING_BATCH_SIZE=10`，模型 extra `max_batch_size: 10` |
+| 页面所有接口 403 但 token 正常 | 前端还持有超管会话 | 退出后用普通账号重新登录 |
 | `permission denied: docker/ragflow-logs/...` | 日志目录由容器内 root 创建 | 用 `sudo` 查看或 `sudo chown -R $USER docker/ragflow-logs` |
 | `docker compose up` 提示容器名冲突 | 与其它栈同名（如 dify 的 `docker` 项目） | 本环境已通过 `COMPOSE_PROJECT_NAME=ragflow` 隔离 |
 | 磁盘不足 | 构建缓存 + 镜像占用 | 见 7.5，预留 ≥ 20 GB |
@@ -458,7 +573,8 @@ git diff main --stat
 |---|---|
 | `build.sh` | pcre2 安装命令在 root 下直接执行、否则 `sudo -E`，保证代理变量不被清除 |
 | `docker/.env` | `COMPOSE_PROJECT_NAME=ragflow`、`SVR_WEB_HTTP_PORT=8088`、`RAGFLOW_IMAGE=ragflow:go-local`、`RAGFLOW_DEV_MODE=true`、随机凭据、停止发布 443 |
-| `docker/docker-compose.yml` | 注释掉 `${SVR_WEB_HTTPS_PORT}:443` 映射（nginx 无 TLS 监听） |
+| `docker/docker-compose.yml` | 注释掉 `${SVR_WEB_HTTPS_PORT}:443` 映射（nginx 无 TLS 监听）；为 `ragflow-cpu` 注入出网代理变量 |
+| `docker/.env` | 新增 `RAGFLOW_HTTP_PROXY/HTTPS_PROXY/NO_PROXY`；`EMBEDDING_BATCH_SIZE=10`（网关向量接口限制） |
 | `DEPLOY.md` | 本文档 |
 
 ### 10.2 命令速查
@@ -494,4 +610,5 @@ docker exec -it ragflow-mysql-1 mysql -uroot -p"$(grep -E '^MYSQL_PASSWORD=' .en
 
 | 日期 | 版本 | 说明 |
 |---|---|---|
+| 2026-10-20 | v1.1 | 新增 6.3 模型接入：容器出网代理、union AI gateway 配置（对话/向量/重排）、向量维度与批大小限制、验证命令；补充 5 条模型相关故障排查 |
 | 2026-10-20 | v1.0 | 初次部署：源码构建 `ragflow:go-local`，Compose 项目 `ragflow`，对外 8088；记录代理构建、pcre2 修复、超管密码处理 |
