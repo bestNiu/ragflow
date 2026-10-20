@@ -228,16 +228,36 @@ print_section() {
 # Detect the package-install command for pcre2 development files.
 # Outputs the command on stdout; empty string if no supported manager is found.
 detect_pcre2_install_cmd() {
+    # Prefer running the package manager directly when we are already root (the
+    # Docker build does): sudo resets the environment by default, which drops
+    # http_proxy/https_proxy and makes the download fail behind a proxy. When
+    # sudo is really needed, -E keeps the proxy variables.
     if [ "$(uname)" = "Darwin" ]; then
         echo "brew install pcre2"
     elif command -v apt-get >/dev/null 2>&1; then
-        echo "sudo apt-get install -y libpcre2-dev"
+        if [ "$(id -u)" -eq 0 ]; then
+            echo "apt-get install -y libpcre2-dev"
+        else
+            echo "sudo -E apt-get install -y libpcre2-dev"
+        fi
     elif command -v zypper >/dev/null 2>&1; then
-        echo "sudo zypper install -y pcre2-devel"
+        if [ "$(id -u)" -eq 0 ]; then
+            echo "zypper install -y pcre2-devel"
+        else
+            echo "sudo -E zypper install -y pcre2-devel"
+        fi
     elif command -v dnf >/dev/null 2>&1; then
-        echo "sudo dnf install -y pcre2-devel"
+        if [ "$(id -u)" -eq 0 ]; then
+            echo "dnf install -y pcre2-devel"
+        else
+            echo "sudo -E dnf install -y pcre2-devel"
+        fi
     elif command -v pacman >/dev/null 2>&1; then
-        echo "sudo pacman -S --noconfirm pcre2"
+        if [ "$(id -u)" -eq 0 ]; then
+            echo "pacman -S --noconfirm pcre2"
+        else
+            echo "sudo -E pacman -S --noconfirm pcre2"
+        fi
     else
         echo ""
     fi
